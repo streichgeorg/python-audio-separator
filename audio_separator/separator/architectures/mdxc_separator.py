@@ -6,6 +6,7 @@ import numpy as np
 from tqdm import tqdm
 from ml_collections import ConfigDict
 from scipy import signal
+from torch.utils.data import IterableDataset
 
 from audio_separator.separator.common_separator import CommonSeparator
 from audio_separator.separator.uvr_lib_v5 import spec_utils
@@ -13,6 +14,22 @@ from audio_separator.separator.uvr_lib_v5.tfc_tdf_v3 import TFC_TDF_net
 from audio_separator.separator.uvr_lib_v5.mel_band_roformer import MelBandRoformer
 from audio_separator.separator.uvr_lib_v5.bs_roformer import BSRoformer
 
+class MixDataset(IterableDataset):
+    def __init__(self, separator, source):
+        self.separator = separator
+        self.source = source
+
+    def __iter__(self):
+        for entry in self.source:
+            mix = entry["audio"]
+            mix = mix[:, :int(30.5 * self.separator.sample_rate)]
+            if mix.shape[0] == 1: mix = torch.cat([mix, mix], 0)
+            mix = mix.numpy()
+            mix = spec_utils.normalize(wave=mix, max_peak=self.separator.normalization_threshold)
+            yield entry["id"], mix
+
+    def __len__(self):
+        return len(self.source)
 
 class MDXCSeparator(CommonSeparator):
     """
@@ -95,7 +112,6 @@ class MDXCSeparator(CommonSeparator):
                 self.model_run = model if not isinstance(model, torch.nn.DataParallel) else model.module
                 self.model_run.load_state_dict(checkpoint)
                 self.model_run.to(self.torch_device).eval()
-
             else:
                 self.logger.debug("Loading TFC_TDF_net model...")
                 self.model_run = TFC_TDF_net(self.model_data_cfgdict, device=self.torch_device)
@@ -163,6 +179,14 @@ class MDXCSeparator(CommonSeparator):
             output_files.append(self.primary_stem_output_path)
         return output_files
 
+    def separate_batched(self, dataset, batch_size=32):
+        mix_ds = MixDataset(self, dataset)
+        dl = torch.utils.data.DataLoader(mix_ds, batch_size=batch_size)
+
+        for ids, batch in tqdm(dl): 
+            result = self.demix_batched(mix=batch)
+            yield ids, result
+
     def pitch_fix(self, source, sr_pitched, orig_mix):
         """
         Change the pitch of the source audio by a number of semitones.
@@ -186,6 +210,15 @@ class MDXCSeparator(CommonSeparator):
         x = x.to(result.device)
         weights = weights.to(result.device)
         result[..., start : start + length] += x[..., :length] * weights[:length]
+        return result
+
+    def overlap_add_batched(self, result, x, weights, start, length):
+        """
+        Adds the overlapping part of the result to the result tensor.
+        """
+        x = x.to(result.device)
+        weights = weights.to(result.device)
+        result[:, ..., start : start + length] += x[:, ..., :length] * weights[:length]
         return result
 
     def demix(self, mix: np.ndarray) -> dict:
@@ -364,3 +397,104 @@ class MDXCSeparator(CommonSeparator):
             else:
                 self.logger.debug("Returning inferenced output for single instrument")
                 return inferenced_output
+
+    def demix_batched(self, mix: np.ndarray) -> dict:
+        """
+        Demixes the input mix into primary and secondary sources using the model and model data.
+
+        Args:
+            mix (np.ndarray): The mix to be demixed.
+        Returns:
+            dict: A dictionary containing the demixed sources.
+        """
+        orig_mix = mix
+
+        if self.pitch_shift != 0:
+            raise NotImplementedError()
+
+        if self.is_roformer:
+            mix = torch.tensor(mix, dtype=torch.float32)
+
+            if self.override_model_segment_size:
+                mdx_segment_size = self.segment_size
+                self.logger.debug(f"Using configured segment size: {mdx_segment_size}")
+            else:
+                mdx_segment_size = self.model_data_cfgdict.inference.dim_t
+                self.logger.debug(f"Using model default segment size: {mdx_segment_size}")
+
+            # num_stems aka "S" in UVR
+            num_stems = 1 if self.model_data_cfgdict.training.target_instrument else len(self.model_data_cfgdict.training.instruments)
+            self.logger.debug(f"Number of stems: {num_stems}")
+
+            # chunk_size aka "C" in UVR
+            chunk_size = self.model_data_cfgdict.audio.hop_length * (mdx_segment_size - 1)
+            self.logger.debug(f"Chunk size: {chunk_size}")
+
+            step = int(self.overlap * self.model_data_cfgdict.audio.sample_rate)
+            self.logger.debug(f"Step: {step}")
+
+            # Create a weighting table and convert it to a PyTorch tensor
+            window = torch.tensor(signal.windows.hamming(chunk_size), dtype=torch.float32)
+
+            device = next(self.model_run.parameters()).device
+
+            # Transfer to the weighting plate for the same device as the other tensors
+            window = window.to(device)
+
+            # with torch.cuda.amp.autocast():
+            with torch.no_grad():
+                req_shape = (len(self.model_data_cfgdict.training.instruments),) + tuple(mix.shape)
+                result = torch.zeros(req_shape, dtype=torch.float32).to(device)
+                counter = torch.zeros(req_shape, dtype=torch.float32).to(device)
+
+                for i in range(0, mix.shape[-1], step):
+                    part = mix[:, :, i : i + chunk_size]
+                    length = part.shape[-1]
+                    if i + chunk_size > mix.shape[-1]:
+                        part = mix[:, :, -chunk_size:]
+                        length = chunk_size
+                    part = part.to(device)
+                    x = self.model_run(part)
+                    if i + chunk_size > mix.shape[-1]:
+                        # Corrigido para adicionar corretamente ao final do tensor
+                        result = self.overlap_add_batched(result, x, window, result.shape[-1] - chunk_size, length)
+                        counter[:, ..., result.shape[-1] - chunk_size :] += window[:length]
+                    else:
+                        result = self.overlap_add_batched(result, x, window, i, length)
+                        counter[:, ..., i : i + length] += window[:length]
+
+            inferenced_outputs = result / counter.clamp(min=1e-10)
+
+        else:
+            raise NotImplementedError()
+
+        if num_stems > 1 or self.is_vocal_main_target:
+            self.logger.debug("Number of stems is greater than 1 or vocals are main target, detaching individual sources and correcting pitch if necessary...")
+
+            sources = {}
+
+            # Iterates over each instrument specified in the model's configuration and its corresponding separated audio source.
+            # self.model_data_cfgdict.training.instruments provides the list of stems.
+            # estimated_sources.cpu().detach().numpy() converts the separated sources tensor to a NumPy array for processing.
+            # Each iteration provides an instrument name ('key') and its separated audio ('value') for further processing.
+            for key, value in zip(self.model_data_cfgdict.training.instruments, inferenced_outputs.cpu().detach().numpy()):
+                self.logger.debug(f"Processing instrument: {key}")
+                if self.pitch_shift != 0:
+                    self.logger.debug(f"Applying pitch correction for {key}")
+                    sources[key] = self.pitch_fix(value, sample_rate, orig_mix)
+                else:
+                    sources[key] = value
+
+            if self.is_vocal_main_target:
+                self.logger.debug("Vocals are main target, detaching vocals and matching array shapes if necessary...")
+                if sources["Vocals"].shape[1] != orig_mix.shape[1]:
+                    sources["Vocals"] = spec_utils.match_array_shapes(sources["Vocals"], orig_mix)
+                sources["Instrumental"] = orig_mix - sources["Vocals"]
+
+            self.logger.debug("Deleting inferenced outputs to free up memory")
+            del inferenced_outputs
+
+            self.logger.debug("Returning separated sources")
+            return sources
+        else:
+            raise NotImplementedError()

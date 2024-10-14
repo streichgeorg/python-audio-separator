@@ -159,7 +159,7 @@ class Separator:
         This method sets up the PyTorch and/or ONNX Runtime inferencing device, using GPU hardware acceleration if available.
         """
         system_info = self.get_system_info()
-        self.check_ffmpeg_installed()
+        # self.check_ffmpeg_installed()
         self.log_onnxruntime_packages()
         self.setup_torch_device(system_info)
 
@@ -718,6 +718,43 @@ class Separator:
         self.logger.info(f'Separation duration: {time.strftime("%H:%M:%S", time.gmtime(int(time.perf_counter() - separate_start_time)))}')
 
         return output_files
+
+    def separate_batched(self, dataset):
+        """
+        Separates the audio file into different stems (e.g., vocals, instruments) using the loaded model.
+
+        This method takes the path to an audio file, processes it through the loaded separation model, and returns
+        the paths to the output files containing the separated audio stems. It handles the entire flow from loading
+        the audio, running the separation, clearing up resources, and logging the process.
+
+        Parameters:
+        - audio_file_path (str): The path to the audio file to be separated.
+
+        Returns:
+        - output_files (list of str): A list containing the paths to the separated audio stem files.
+        """
+        # Starting the separation process
+        separate_start_time = time.perf_counter()
+
+        self.logger.debug(f"Normalization threshold set to {self.normalization_threshold}, waveform will lowered to this max amplitude to avoid clipping.")
+
+        # Run separation method for the loaded model
+        it = self.model_instance.separate_batched(dataset)
+        yield from it
+
+        # Clear GPU cache to free up memory
+        self.model_instance.clear_gpu_cache()
+
+        # Unset more separation params to prevent accidentally re-using the wrong source files or output paths
+        self.model_instance.clear_file_specific_paths()
+
+        # Remind the user one more time if they used a VIP model, so the message doesn't get lost in the logs
+        self.print_uvr_vip_message()
+
+        # Log the completion of the separation process
+        self.logger.debug("Separation process completed.")
+        self.logger.info(f'Separation duration: {time.strftime("%H:%M:%S", time.gmtime(int(time.perf_counter() - separate_start_time)))}')
+
 
     def download_model_and_data(self, model_filename):
         """

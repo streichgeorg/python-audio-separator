@@ -186,3 +186,6 @@ def main():
     output_files = separator.separate(args.audio_file)
 
     logger.info(f"Separation complete! Output file(s): {' '.join(output_files)}")
+
+if __name__ == "__main__":
+    main()
