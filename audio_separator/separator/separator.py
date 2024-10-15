@@ -719,7 +719,7 @@ class Separator:
 
         return output_files
 
-    def separate_batched(self, dataset):
+    def separate_batched(self, dataset, batch_size=16):
         """
         Separates the audio file into different stems (e.g., vocals, instruments) using the loaded model.
 
@@ -739,7 +739,7 @@ class Separator:
         self.logger.debug(f"Normalization threshold set to {self.normalization_threshold}, waveform will lowered to this max amplitude to avoid clipping.")
 
         # Run separation method for the loaded model
-        it = self.model_instance.separate_batched(dataset)
+        it = self.model_instance.separate_batched(dataset, batch_size)
         yield from it
 
         # Clear GPU cache to free up memory

@@ -179,7 +179,7 @@ class MDXCSeparator(CommonSeparator):
             output_files.append(self.primary_stem_output_path)
         return output_files
 
-    def separate_batched(self, dataset, batch_size=32):
+    def separate_batched(self, dataset, batch_size=16):
         mix_ds = MixDataset(self, dataset)
         dl = torch.utils.data.DataLoader(mix_ds, batch_size=batch_size)
 
